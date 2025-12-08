@@ -11,6 +11,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import os
 import sys
+import random
+import numpy as np
 from tqdm import tqdm
 
 # Add parent directory to path
@@ -194,7 +196,19 @@ class Phase2Trainer:
         torch.save(checkpoint, path)
         print(f"  ✓ Checkpoint saved with config: {path}")
 
+
+def set_seed(seed=42):
+    """Set seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
+    set_seed(42)
     # Configuration
     config = {
         # Data config

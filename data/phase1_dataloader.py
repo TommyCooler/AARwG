@@ -48,7 +48,7 @@ def prepare_phase1_data(
         
         # Load data using appropriate loader
         # Different datasets have different path structures
-        if loader_name == "gesture":
+        if loader_name == "pd" or loader_name == "ecg" or loader_name == "psm" or loader_name == "smd":
             # Gesture uses train/ and test/ directly, not labeled/
             data_path = os.path.join(data_path_base, dataset_name)
         else:

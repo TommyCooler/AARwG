@@ -4,6 +4,7 @@ import torch.optim as optim
 import os
 import sys
 from tqdm import tqdm
+import random, numpy as np, torch
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -193,12 +194,22 @@ class Phase1Trainer:
         return checkpoint["epoch"], checkpoint["loss"]
 
 
+def set_seed(seed=42):
+    """Set seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
     """
     Main training script for Phase 1.
     Example: Train on UCR datasets 135-138
     """
-
+    set_seed(42)
     # Configuration
     config = {
         "window_size": 16,
@@ -235,14 +246,19 @@ def main():
         # {"name": "ucr", "subset": "136", "loader": "ucr"},
         # {"name": "ucr", "subset": "137", "loader": "ucr"},
         # {"name": "ucr", "subset": "138", "loader": "ucr"},
-        # {"name": "pd", "subset": None, "loader": "pd"},
-        # {"name": "gesture", "subset": None, "loader": "gesture"},
-        {"name": "ecg", "subset": "chfdb_chf01_275.pkl", "loader": "ecg"},
-        {"name": "ecg", "subset": "chfdb_chf13_45590.pkl", "loader": "ecg"},
-        {"name": "ecg", "subset": "chfdbchf15.pkl", "loader": "ecg"},
-        {"name": "ecg", "subset": "ltstdb_20221_43.pkl", "loader": "ecg"},
-        {"name": "ecg", "subset": "ltstdb_20321_240.pkl", "loader": "ecg"},
-        {"name": "ecg", "subset": "mitdb__100_180.pkl", "loader": "ecg"},
+        # {"name": "psm", "subset": None, "loader": "psm"},
+        # {"name": "ecg", "subset": "chfdb_chf01_275.pkl", "loader": "ecg"},
+        # {"name": "ecg", "subset": "chfdb_chf13_45590.pkl", "loader": "ecg"},
+        # {"name": "ecg", "subset": "chfdbchf15.pkl", "loader": "ecg"},
+        # {"name": "ecg", "subset": "ltstdb_20221_43.pkl", "loader": "ecg"},
+        # {"name": "ecg", "subset": "ltstdb_20321_240.pkl", "loader": "ecg"},
+        # {"name": "ecg", "subset": "mitdb__100_180.pkl", "loader": "ecg"},
+        # {"name": "pd", "subset": "power_data.pkl", "loader": "pd"},
+        # {"name": "gesture", "subset": "ann_gun_CentroidA.pkl", "loader": "gesture"},
+        # {"name": "smd", "subset": "machine-1-1", "loader": "smd"},
+        # {"name": "smd", "subset": "machine-2-1", "loader": "smd"},
+        # {"name": "smd", "subset": "machine-3-2", "loader": "smd"},
+        # {"name": "smd", "subset": "machine-3-7", "loader": "smd"},
     ]
 
     # Dataloader function mapping

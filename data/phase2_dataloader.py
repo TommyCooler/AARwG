@@ -82,7 +82,7 @@ def prepare_phase2_data(
     """
     # Load data
     # Different datasets have different path structures
-    if dataset_name == "gesture":
+    if dataset_name == "pd" or dataset_name == "ecg" or dataset_name == "psm" or dataset_name == "smd":
         # Gesture uses train/ and test/ directly, not labeled/
         data_path = os.path.join(data_path_base, dataset_name)
     else:
