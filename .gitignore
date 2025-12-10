@@ -27,7 +27,6 @@ ENV/
 *.ipynb
 
 # Model Checkpoints
-checkpoints/
 *.pt
 *.pth
 *.ckpt
