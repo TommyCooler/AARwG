@@ -18,7 +18,11 @@ from tqdm import tqdm
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.phase2_dataloader import prepare_phase2_data, Phase2TrainDataset, Phase2Dataset
+from data.phase2_dataloader import (
+    prepare_phase2_data,
+    Phase2TrainDataset,
+    Phase2Dataset,
+)
 from data.dataloader import (
     ucr_sub_ds_processing,
     smd_sub_ds_processing,
@@ -31,6 +35,7 @@ from data.dataloader import (
 from modules.augmentation import Augmentation
 from modules.random_masking import RandomTimeMasking, InferenceMasking
 from phase2.agf_tcn import Agf_TCN
+from phase2.Gaussian import GaussianStatsCollector
 from utils.point_adjustment import evaluate_with_pa
 
 import setproctitle
@@ -53,8 +58,8 @@ class Phase2Trainer:
         use_scheduler: bool = True,
         use_grad_clip: bool = True,
         max_grad_norm: float = 1.0,
-        config: dict = None,  # Store config for inference
-        mask_ratio: float = 0.15,  # Random time masking ratio
+        config: dict = None,
+        mask_ratio: float = 0.15,
     ):
         self.augmentation = augmentation.to(device)
         self.agf_tcn = agf_tcn.to(device)
@@ -71,7 +76,7 @@ class Phase2Trainer:
         self._freeze_augmentation()
 
         # Only optimize AGF-TCN parameters
-        self.optimizer = optim.Adam(
+        self.optimizer = optim.AdamW(
             self.agf_tcn.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
 
@@ -124,6 +129,45 @@ class Phase2Trainer:
             print(f"  ✓ Augmentation in eval mode (deterministic)")
         else:
             print(f"  ⚠ WARNING: Augmentation not properly frozen!")
+
+    def collect_gaussian_stats(
+        self, loader, apply_mask: bool = True, save_path: str = None
+    ):
+        """Compute mean/variance/covariance over augmented windows for the full dataset."""
+        prev_aug_mode = self.augmentation.training
+        prev_mask_mode = self.time_masking.training
+
+        # Augmentation stays frozen; masking mirrors training behavior when requested
+        self.augmentation.eval()
+        if apply_mask:
+            self.time_masking.train()
+        else:
+            self.time_masking.eval()
+
+        collector = GaussianStatsCollector(
+            n_features=self.config["n_channels"], device=self.device
+        )
+
+        with torch.no_grad():
+            for batch_data in tqdm(loader, desc="Collecting Gaussian stats"):
+                batch_data = batch_data.to(self.device)
+
+                masked = self.time_masking(batch_data) if apply_mask else batch_data
+                augmented = self.augmentation(masked)
+
+                collector.update_from_augmented(augmented)
+
+        stats = collector.finalize()
+
+        if save_path is not None:
+            collector.save(save_path, stats)
+            print(f"  ✓ Gaussian stats saved to: {save_path}")
+
+        # Restore modes
+        self.augmentation.train(prev_aug_mode)
+        self.time_masking.train(prev_mask_mode)
+
+        return stats
 
     def train_epoch(self, train_loader, epoch):
         """Train for one epoch"""
@@ -223,11 +267,13 @@ class Phase2Trainer:
         """
         self.agf_tcn.eval()
         self.augmentation.eval()
-        
+
         # Initialize inference masking
-        inference_masking = InferenceMasking(mask_ratio=self.config.get("mask_ratio", 0.15)).to(self.device)
+        inference_masking = InferenceMasking(
+            mask_ratio=self.config.get("mask_ratio", 0.15)
+        ).to(self.device)
         inference_masking.reset()
-        
+
         all_timestep_scores = []
         global_window_idx = 0
 
@@ -340,20 +386,24 @@ def main():
     # Step 1: Load Phase 1 checkpoint to get window_size and stride
     print("\n[1/6] Loading Phase 1 checkpoint for window_size and stride...")
     phase1_checkpoint_path = os.path.join(project_root, config["phase1_checkpoint"])
-    
+
     if not os.path.exists(phase1_checkpoint_path):
         raise FileNotFoundError(
             f"Phase 1 checkpoint not found at {phase1_checkpoint_path}\n"
             f"Please train Phase 1 first or update 'phase1_checkpoint' path in config."
         )
-    
-    phase1_checkpoint = torch.load(phase1_checkpoint_path, map_location=config["device"])
+
+    phase1_checkpoint = torch.load(
+        phase1_checkpoint_path, map_location=config["device"]
+    )
     phase1_config = phase1_checkpoint["config"]
-    
+
     # Get window_size and stride from Phase 1
     config["window_size"] = phase1_config["window_size"]
     config["stride"] = phase1_config["stride"]
-    print(f"  ✓ Loaded window_size: {config['window_size']}, stride: {config['stride']} from Phase 1")
+    print(
+        f"  ✓ Loaded window_size: {config['window_size']}, stride: {config['stride']} from Phase 1"
+    )
 
     # Step 2: Prepare data
     print(f"\n[2/6] Loading dataset: {config['dataset_name']}_{config['subset']}")
@@ -393,7 +443,7 @@ def main():
         drop_last=True,
     )
     print(f"  Train batches: {len(train_loader)}")
-    
+
     # Test dataset for inference
     test_dataset = Phase2Dataset(test_windows, test_labels)
     test_loader = DataLoader(
@@ -417,7 +467,7 @@ def main():
     # Step 4: Initialize Augmentation (load from Phase 1)
     print("\n[4/6] Loading pre-trained Augmentation from Phase 1...")
     # Phase 1 checkpoint already loaded above
-    
+
     # Copy augmentation config from Phase 1 to Phase 2 config (for saving checkpoint)
     config["aug_kernel_size_cnn"] = phase1_config["aug_kernel_size_cnn"]
     config["aug_num_layers"] = phase1_config["aug_num_layers"]
@@ -426,7 +476,7 @@ def main():
     config["aug_hard_gumbel_softmax"] = phase1_config["aug_hard_gumbel_softmax"]
     config["aug_transformer_d_model"] = phase1_config["aug_transformer_d_model"]
     config["aug_transformer_nhead"] = phase1_config["aug_transformer_nhead"]
-    
+
     # Initialize augmentation with Phase 1 config
     augmentation = Augmentation(
         in_channels=n_channels,
@@ -473,12 +523,26 @@ def main():
         mask_ratio=config["mask_ratio"],
     )
 
+    # Optional: collect Gaussian statistics over all augmented windows
+    stats_save_path = os.path.join(project_root, "phase2", "gaussian_stats.pt")
+    gaussian_stats = trainer.collect_gaussian_stats(
+        loader=train_loader, apply_mask=True, save_path=stats_save_path
+    )
+    mean_preview = gaussian_stats["mean"].flatten().cpu().numpy()
+    var_preview = gaussian_stats["variance"].flatten().cpu().numpy()
+
+    print("\n[Stats] Gaussian summary (mean/var over features):")
+    print(f"  count: {int(gaussian_stats['count'])}")
+    print(f"  mean (first 5): {mean_preview[:5]}")
+    print(f"  variance (first 5): {var_preview[:5]}")
+
     # Step 7: Training loop
     print("\n[7/7] Starting training...")
     print(f"  Epochs: {config['num_epochs']}")
     print(f"  Device: {config['device']}")
-    print(f"  Inference will run after each epoch")
+    print(f"  Inference will run only when loss decreases")
 
+    best_loss = float("inf")
     best_f1 = 0.0
     best_epoch = 0
 
@@ -498,51 +562,55 @@ def main():
         if trainer.scheduler is not None:
             trainer.scheduler.step(train_metrics["train_loss"])
 
-        # Run inference on test set
-        print(f"\nRunning inference on test set...")
-        inference_metrics = trainer.evaluate(
-            test_loader=test_loader,
-            labels=labels,
-            stride=config["stride"]
-        )
+        # Only run inference when loss decreases
+        if train_metrics["train_loss"] < best_loss:
+            best_loss = train_metrics["train_loss"]
 
-        # Get F1 score
-        f1_score = inference_metrics.get("best_f1", 0.0)
-
-        # Print inference metrics
-        print(f"\nEpoch {epoch} Inference Results:")
-        print(f"  F1-Score: {f1_score:.4f}")
-        print(f"  Precision: {inference_metrics.get('best_precision', 0.0):.4f}")
-        print(f"  Recall: {inference_metrics.get('best_recall', 0.0):.4f}")
-        print(f"  Accuracy: {inference_metrics.get('best_accuracy', 0.0):.4f}")
-
-        # Combine metrics for checkpoint
-        combined_metrics = {
-            **train_metrics,
-            "f1": f1_score,
-            "precision": inference_metrics.get("best_precision", 0.0),
-            "recall": inference_metrics.get("best_recall", 0.0),
-            "accuracy": inference_metrics.get("best_accuracy", 0.0),
-        }
-
-        # Save checkpoint when F1 improves
-        if f1_score > best_f1:
-            best_f1 = f1_score
-            best_epoch = epoch
-
-            save_path = os.path.join(
-                project_root,
-                config["save_dir"],
-                f"phase2_{config['dataset_name']}_{config['subset']}_best.pt",
+            # Run inference on test set
+            print(f"\nRunning inference on test set (loss improved)...")
+            inference_metrics = trainer.evaluate(
+                test_loader=test_loader, labels=labels, stride=config["stride"]
             )
-            trainer.save_checkpoint(save_path, epoch, combined_metrics)
-            print(f"  ✓ New best model! F1-Score: {best_f1:.4f} (Epoch {epoch})")
+
+            # Get F1 score
+            f1_score = inference_metrics.get("best_f1", 0.0)
+
+            # Print inference metrics
+            print(f"\nEpoch {epoch} Inference Results:")
+            print(f"  F1-Score: {f1_score:.4f}")
+            print(f"  Precision: {inference_metrics.get('best_precision', 0.0):.4f}")
+            print(f"  Recall: {inference_metrics.get('best_recall', 0.0):.4f}")
+            print(f"  Accuracy: {inference_metrics.get('best_accuracy', 0.0):.4f}")
+
+            # Combine metrics for checkpoint
+            combined_metrics = {
+                **train_metrics,
+                "f1": f1_score,
+                "precision": inference_metrics.get("best_precision", 0.0),
+                "recall": inference_metrics.get("best_recall", 0.0),
+                "accuracy": inference_metrics.get("best_accuracy", 0.0),
+            }
+
+            # Save checkpoint when F1 improves
+            if f1_score > best_f1:
+                best_f1 = f1_score
+                best_epoch = epoch
+
+                save_path = os.path.join(
+                    project_root,
+                    config["save_dir"],
+                    f"phase2_{config['dataset_name']}_{config['subset']}_best.pt",
+                )
+                trainer.save_checkpoint(save_path, epoch, combined_metrics)
+                print(f"  ✓ New best model! F1-Score: {best_f1:.4f} (Epoch {epoch})")
+        else:
+            print(f"  Loss did not improve (best: {best_loss:.6f}), skipping inference")
 
     print("\n" + "=" * 60)
     print("Training completed!")
     print(f"Best F1-Score: {best_f1:.4f} (Epoch {best_epoch})")
     print(
-        f"Saved checkpoint: phase2/checkpoints/phase2_{config['dataset_name']}_{config['subset']}_best.pt"
+        f"Saved checkpoint: checkpoints/phase2_{config['dataset_name']}_{config['subset']}_best.pt"
     )
     print("=" * 60)
 

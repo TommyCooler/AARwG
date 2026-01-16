@@ -58,7 +58,7 @@ class InferenceMasking(nn.Module):
         if self.mask_ratio == 0.0:
             return x
 
-        batch_size, n_channels, seq_len = x.shape
+        batch_size, _, seq_len = x.shape
 
         # Determine window index
         if window_idx is not None:
