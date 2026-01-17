@@ -316,8 +316,8 @@ class Phase2Trainer:
 
         return metrics
 
-    def save_checkpoint(self, path, epoch, metrics):
-        """Save model checkpoint with full config for inference"""
+    def save_checkpoint(self, path, epoch, metrics, gaussian_stats=None):
+        """Save model checkpoint with full config and Gaussian statistics for inference"""
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         checkpoint = {
@@ -331,6 +331,10 @@ class Phase2Trainer:
 
         if self.scheduler is not None:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+
+        # Include Gaussian statistics if provided
+        if gaussian_stats is not None:
+            checkpoint["gaussian_stats"] = gaussian_stats
 
         torch.save(checkpoint, path)
         print(f"  ✓ Checkpoint saved with config: {path}")
@@ -523,10 +527,10 @@ def main():
         mask_ratio=config["mask_ratio"],
     )
 
-    # Optional: collect Gaussian statistics over all augmented windows
-    stats_save_path = os.path.join(project_root, "phase2", "gaussian_stats.pt")
+    # Collect Gaussian statistics over all augmented windows (saved in checkpoint later)
+    print("\n[Stats] Collecting Gaussian statistics...")
     gaussian_stats = trainer.collect_gaussian_stats(
-        loader=train_loader, apply_mask=True, save_path=stats_save_path
+        loader=train_loader, apply_mask=True, save_path=None
     )
     mean_preview = gaussian_stats["mean"].flatten().cpu().numpy()
     var_preview = gaussian_stats["variance"].flatten().cpu().numpy()
@@ -601,7 +605,9 @@ def main():
                     config["save_dir"],
                     f"phase2_{config['dataset_name']}_{config['subset']}_best.pt",
                 )
-                trainer.save_checkpoint(save_path, epoch, combined_metrics)
+                trainer.save_checkpoint(
+                    save_path, epoch, combined_metrics, gaussian_stats=gaussian_stats
+                )
                 print(f"  ✓ New best model! F1-Score: {best_f1:.4f} (Epoch {epoch})")
         else:
             print(f"  Loss did not improve (best: {best_loss:.6f}), skipping inference")

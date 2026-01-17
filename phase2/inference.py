@@ -33,6 +33,7 @@ from data.dataloader import (
 from modules.augmentation import Augmentation
 from modules.random_masking import InferenceMasking
 from phase2.agf_tcn import Agf_TCN
+from phase2.Gaussian import GaussianStatsCollector
 from utils.point_adjustment import evaluate_with_pa
 
 
@@ -127,11 +128,11 @@ class Phase2Inference:
         self.augmentation = Augmentation(
             in_channels=self.config["n_channels"],
             seq_len=self.config["window_size"],
-            kernel_size=self.config["aug_kernel_size_cnn"],  
+            kernel_size=self.config["aug_kernel_size_cnn"],
             num_layers=self.config["aug_num_layers"],
             dropout=self.config["aug_dropout"],
             temperature=self.config["aug_temperature"],
-            hard=self.config["aug_hard_gumbel_softmax"],    
+            hard=self.config["aug_hard_gumbel_softmax"],
             transformer_d_model=self.config["aug_transformer_d_model"],
             transformer_nhead=self.config["aug_transformer_nhead"],
         )
@@ -161,6 +162,14 @@ class Phase2Inference:
         print(f"  ✓ Inference masking initialized")
         print(f"    Mask ratio: {self.config['mask_ratio']}")
 
+        # Load Gaussian statistics if available
+        self.gaussian_stats = None
+        if "gaussian_stats" in checkpoint:
+            self.gaussian_stats = checkpoint["gaussian_stats"]
+            print(f"  ✓ Gaussian stats loaded from checkpoint")
+            print(f"    Mean shape: {self.gaussian_stats['mean'].shape}")
+            print(f"    Covariance shape: {self.gaussian_stats['covariance'].shape}")
+
         # Print checkpoint info
         if "metrics" in checkpoint:
             metrics = checkpoint["metrics"]
@@ -168,8 +177,23 @@ class Phase2Inference:
             print(f"  Train Loss: {metrics['train_loss']:.6f}")
 
     def predict(
-        self, test_loader, stride=None, labels=None
+        self,
+        test_loader,
+        stride=None,
+        labels=None,
+        sigmoid_scale: float = 1.0,
+        sigmoid_shift: float = 0.0,
     ):
+        """
+        Run inference with optional Gaussian-based anomaly weighting.
+
+        If gaussian_stats available:
+            1. Compute reconstruction loss (anomaly score per window)
+            2. Map to time series → anomaly_scores
+            3. Compute lambda from augmented vectors
+            4. Map lambda to time series → lambda_scores
+            5. final_score = anomaly_scores * lambda_scores
+        """
 
         print("\n🔮 Running inference...")
         print("  Applying inference masking:")
@@ -177,6 +201,7 @@ class Phase2Inference:
         print("    - Window 1 to last: Only mask last time-step")
 
         all_timestep_scores = []
+        all_lambda_scores = [] if self.gaussian_stats is not None else None
 
         # Reset window index for masking
         self.inference_masking.reset()
@@ -200,11 +225,35 @@ class Phase2Inference:
                 # Apply augmentation to masked data
                 augmented_data = self.augmentation(masked_data)
                 reconstructed = self.agf_tcn(augmented_data)
+
+                # Reconstruction loss per time-step [B, T]
                 timestep_losses = torch.mean(
                     (reconstructed - augmented_data) ** 2, dim=1
                 )
-
                 all_timestep_scores.append(timestep_losses.cpu().numpy())
+
+                # Compute Gaussian-based anomaly weighting if available
+                if self.gaussian_stats is not None:
+                    # Convert augmented batch [B, C, T] → [B*T, C]
+                    B, C, T = augmented_data.shape
+                    vectors = augmented_data.permute(0, 2, 1).reshape(-1, C)  # [B*T, C]
+
+                    # Compute negative log-likelihood
+                    mean = self.gaussian_stats["mean"].to(self.device)
+                    cov = self.gaussian_stats["covariance"].to(self.device)
+
+                    nll = GaussianStatsCollector.compute_negative_log_likelihood(
+                        vectors=vectors, mean=mean, covariance=cov
+                    )  # [B*T]
+
+                    # Convert NLL to anomaly score using sigmoid
+                    lambda_v = GaussianStatsCollector.anomaly_score_with_sigmoid(
+                        nll=nll, scale=sigmoid_scale, shift=sigmoid_shift
+                    )  # [B*T] in [0, 1]
+
+                    # Reshape back to [B, T]
+                    lambda_batch = lambda_v.reshape(B, T).cpu().numpy()
+                    all_lambda_scores.append(lambda_batch)
 
         timestep_scores_all_windows = np.concatenate(all_timestep_scores, axis=0)
 
@@ -224,6 +273,7 @@ class Phase2Inference:
             f"   Strategy: Window 0 → all time-steps, Window i>0 → last time-step only"
         )
 
+        # Map reconstruction loss to anomaly scores
         anomaly_scores = map_window_scores_to_timeseries(
             timestep_scores_all_windows=timestep_scores_all_windows,
             n_time_steps=len(labels),
@@ -235,6 +285,28 @@ class Phase2Inference:
         print(
             f"   Coverage: {np.sum(~np.isnan(anomaly_scores))}/{len(anomaly_scores)} steps have scores"
         )
+
+        # Apply Gaussian weighting if available
+        if all_lambda_scores is not None:
+            lambda_all_windows = np.concatenate(all_lambda_scores, axis=0)
+
+            # Map lambda scores to time series
+            lambda_scores = map_window_scores_to_timeseries(
+                timestep_scores_all_windows=lambda_all_windows,
+                n_time_steps=len(labels),
+                window_size=window_size,
+                stride=stride,
+            )
+
+            # Multiply anomaly scores by lambda scores
+            anomaly_scores = anomaly_scores * lambda_scores
+
+            print("\n✓ Applied Gaussian-weighted scaling")
+            print(
+                f"  Lambda range: [{np.min(lambda_scores):.4f}, {np.max(lambda_scores):.4f}]"
+            )
+        else:
+            print("\n⚠ Gaussian stats not available; using reconstruction loss only")
 
         # Evaluate with Point Adjustment (always searches for best threshold)
         print("\n🔍 Searching for best threshold (with Point Adjustment)...")
