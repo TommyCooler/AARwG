@@ -187,13 +187,14 @@ class Phase2Trainer:
             # Forward pass
             with torch.no_grad():
                 # Get augmented data (frozen augmentation)
+                target_features = self.augmentation(batch_data)
                 augmented_data = self.augmentation(masked_data)
 
             # Reconstruct from augmented data
             reconstructed = self.agf_tcn(augmented_data)
 
             # Compute reconstruction loss
-            loss = self.criterion(reconstructed, augmented_data)
+            loss = self.criterion(reconstructed, target_features)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -530,7 +531,7 @@ def main():
     # Collect Gaussian statistics over all augmented windows (saved in checkpoint later)
     print("\n[Stats] Collecting Gaussian statistics...")
     gaussian_stats = trainer.collect_gaussian_stats(
-        loader=train_loader, apply_mask=True, save_path=None
+        loader=train_loader, apply_mask=False, save_path=None
     )
     mean_preview = gaussian_stats["mean"].flatten().cpu().numpy()
     var_preview = gaussian_stats["variance"].flatten().cpu().numpy()

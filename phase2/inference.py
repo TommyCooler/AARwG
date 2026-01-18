@@ -212,6 +212,8 @@ class Phase2Inference:
                 batch_data = batch_data.to(self.device)
                 batch_size = batch_data.shape[0]
 
+                target_features = self.augmentation(batch_data)
+
                 # Apply inference masking with window index tracking
                 masked_data = batch_data.clone()
                 for i in range(batch_size):
@@ -228,7 +230,7 @@ class Phase2Inference:
 
                 # Reconstruction loss per time-step [B, T]
                 timestep_losses = torch.mean(
-                    (reconstructed - augmented_data) ** 2, dim=1
+                    (reconstructed - target_features) ** 2, dim=1
                 )
                 all_timestep_scores.append(timestep_losses.cpu().numpy())
 
