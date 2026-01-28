@@ -1,13 +1,3 @@
-"""
-Phase 2 Inference: Anomaly Detection với Best Threshold Search
-
-Usage:
-    python phase2/inference.py --checkpoint checkpoints/phase2_ucr_135_best.pt
-
-hoặc tùy chỉnh:
-    python phase2/inference.py --checkpoint <path> --dataset ucr --subset 135
-"""
-
 import torch
 from torch.utils.data import DataLoader
 import os
@@ -112,7 +102,9 @@ class Phase2Inference:
         print(f"\n📦 Loading checkpoint: {checkpoint_path}")
 
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
 
         # Extract config
         if "config" not in checkpoint:
@@ -229,9 +221,7 @@ class Phase2Inference:
                 reconstructed = self.agf_tcn(augmented_data)
 
                 # Reconstruction loss per time-step [B, T]
-                timestep_losses = torch.mean(
-                    (reconstructed - target_features) ** 2, dim=1
-                )
+                timestep_losses = torch.mean((reconstructed - batch_data) ** 2, dim=1)
                 all_timestep_scores.append(timestep_losses.cpu().numpy())
 
                 # Compute Gaussian-based anomaly weighting if available

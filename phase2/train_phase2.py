@@ -1,10 +1,3 @@
-"""
-Phase 2 Training: Supervised Anomaly Detection with AGF-TCN
-- Load pre-trained Augmentation module (frozen)
-- Train AGF-TCN for reconstruction
-- MSE Loss between augmented data and reconstructed data
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,6 +7,7 @@ import sys
 import random
 import numpy as np
 from tqdm import tqdm
+from phase2.Gaussian import GaussianStatsCollector
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -76,7 +70,7 @@ class Phase2Trainer:
         self._freeze_augmentation()
 
         # Only optimize AGF-TCN parameters
-        self.optimizer = optim.AdamW(
+        self.optimizer = optim.Adam(
             self.agf_tcn.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
 
@@ -181,20 +175,18 @@ class Phase2Trainer:
         for batch_idx, batch_data in enumerate(pbar):
             batch_data = batch_data.to(self.device)
 
-            # Apply random time masking before augmentation
-            masked_data = self.time_masking(batch_data)
-
             # Forward pass
             with torch.no_grad():
                 # Get augmented data (frozen augmentation)
-                target_features = self.augmentation(batch_data)
-                augmented_data = self.augmentation(masked_data)
+                target_data = self.augmentation(batch_data)
+
+            masked_target = self.time_masking(target_data)
 
             # Reconstruct from augmented data
-            reconstructed = self.agf_tcn(augmented_data)
+            reconstructed = self.agf_tcn(masked_target)
 
             # Compute reconstruction loss
-            loss = self.criterion(reconstructed, target_features)
+            loss = self.criterion(reconstructed, target_data)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -262,10 +254,16 @@ class Phase2Trainer:
 
         return timeseries_scores
 
-    def evaluate(self, test_loader, labels, stride):
-        """
-        Run inference on test data and return F1 score and metrics.
-        """
+    def evaluate(
+        self,
+        test_loader,
+        labels,
+        stride,
+        gaussian_stats=None,
+        sigmoid_scale=1.0,
+        sigmoid_shift=0.0,
+    ):
+
         self.agf_tcn.eval()
         self.augmentation.eval()
 
@@ -276,6 +274,7 @@ class Phase2Trainer:
         inference_masking.reset()
 
         all_timestep_scores = []
+        all_lambda_scores = [] if gaussian_stats is not None else None
         global_window_idx = 0
 
         with torch.no_grad():
@@ -283,34 +282,75 @@ class Phase2Trainer:
                 batch_data = batch_data.to(self.device)
                 batch_size = batch_data.shape[0]
 
+                target_data = self.augmentation(batch_data)
+
                 # Apply inference masking with window index tracking
-                masked_data = batch_data.clone()
+                masked_target = batch_data.clone()
                 for i in range(batch_size):
                     window_data = batch_data[i : i + 1]
                     masked_window = inference_masking(
                         window_data, window_idx=global_window_idx
                     )
-                    masked_data[i] = masked_window[0]
+                    masked_target[i] = masked_window[0]
                     global_window_idx += 1
 
                 # Apply augmentation to masked data
-                augmented_data = self.augmentation(masked_data)
+                augmented_data = self.augmentation(masked_target)
                 reconstructed = self.agf_tcn(augmented_data)
                 timestep_losses = torch.mean(
-                    (reconstructed - augmented_data) ** 2, dim=1
+                    (reconstructed - masked_target) ** 2, dim=1
                 )
 
                 all_timestep_scores.append(timestep_losses.cpu().numpy())
 
+                # Compute Gaussian-based weighting if available
+                if gaussian_stats is not None:
+
+                    # Convert augmented batch [B, C, T] → [B*T, C]
+                    B, C, T = augmented_data.shape
+                    vectors = augmented_data.permute(0, 2, 1).reshape(-1, C)  # [B*T, C]
+
+                    # Compute negative log-likelihood
+                    mean = gaussian_stats["mean"].to(self.device)
+                    cov = gaussian_stats["covariance"].to(self.device)
+
+                    nll = GaussianStatsCollector.compute_negative_log_likelihood(
+                        vectors=vectors, mean=mean, covariance=cov
+                    )  # [B*T]
+
+                    # Convert NLL to anomaly score using sigmoid
+                    lambda_v = GaussianStatsCollector.anomaly_score_with_sigmoid(
+                        nll=nll, scale=sigmoid_scale, shift=sigmoid_shift
+                    )  # [B*T] in [0, 1]
+
+                    # Reshape back to [B, T]
+                    lambda_batch = lambda_v.reshape(B, T).cpu().numpy()
+                    all_lambda_scores.append(lambda_batch)
+
         timestep_scores_all_windows = np.concatenate(all_timestep_scores, axis=0)
 
-        # Map window scores to time series
+        # Map reconstruction loss to anomaly scores
         anomaly_scores = self.map_window_scores_to_timeseries(
             timestep_scores_all_windows=timestep_scores_all_windows,
             n_time_steps=len(labels),
             window_size=self.config["window_size"],
             stride=stride,
         )
+
+        # Apply Gaussian weighting if available
+        if all_lambda_scores is not None:
+            lambda_all_windows = np.concatenate(all_lambda_scores, axis=0)
+
+            # Map lambda scores to time series
+            lambda_scores = self.map_window_scores_to_timeseries(
+                timestep_scores_all_windows=lambda_all_windows,
+                n_time_steps=len(labels),
+                window_size=self.config["window_size"],
+                stride=stride,
+            )
+
+            # Multiply anomaly scores by lambda scores
+            anomaly_scores = anomaly_scores * lambda_scores
 
         # Evaluate with Point Adjustment
         metrics = evaluate_with_pa(anomaly_scores=anomaly_scores, labels=labels)
@@ -574,7 +614,10 @@ def main():
             # Run inference on test set
             print(f"\nRunning inference on test set (loss improved)...")
             inference_metrics = trainer.evaluate(
-                test_loader=test_loader, labels=labels, stride=config["stride"]
+                test_loader=test_loader,
+                labels=labels,
+                stride=config["stride"],
+                gaussian_stats=gaussian_stats,
             )
 
             # Get F1 score
